@@ -1,0 +1,6 @@
+# Keep Unix line endings: the scripts run on Linux (an CRLF checkout on Windows would break them)
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf

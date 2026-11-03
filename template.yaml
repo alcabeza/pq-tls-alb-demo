@@ -1,0 +1,501 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Disposable demo: ALB post-quantum TLS policies. One internal ALB with three HTTPS listeners
+  (PQ security policy on 443, classical policy on 8443), connection logs to S3, and a test
+  client instance (SSM only, no inbound ports) with OpenSSL 3.5+.
+
+Parameters:
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. ARN of your own ACM certificate in this Region. Leave empty (default) and the stack generates and
+      imports a self-signed certificate for the demo, and deletes it with the stack.
+    AllowedPattern: '^(arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-zA-Z0-9-]+)?$'
+  PqSecurityPolicy:
+    Type: String
+    Default: ELBSecurityPolicy-TLS13-1-2-Res-PQ-2025-09
+    Description: Security policy of the PQ listener (port 443). Must contain PQ in its name.
+  ClassicSecurityPolicy:
+    Type: String
+    Default: ELBSecurityPolicy-TLS13-1-2-Res-2021-06
+    Description: Security policy of the control listener (port 8443). Classical, no ML-KEM.
+  Tls13OnlySecurityPolicy:
+    Type: String
+    Default: ELBSecurityPolicy-TLS13-1-3-PQ-2025-09
+    Description: Security policy of the TLS 1.3 only PQ listener (port 9443).
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small, t3.medium, t3.large]
+  LogPrefix:
+    Type: String
+    Default: alb-conn
+    AllowedPattern: '^[a-zA-Z0-9-]{1,40}$'
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  GenerateCertificate: !Equals [!Ref CertificateArn, '']
+
+Resources:
+  # ---------------------------------------------------------------- self-signed certificate (custom resource)
+  CertFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: GenerateCertificate
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: acm-import-delete
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ImportAndTag     # no resource exists yet at import time
+                Effect: Allow
+                Action: [acm:ImportCertificate, acm:AddTagsToCertificate]
+                Resource: '*'
+              - Sid: DeleteOwnCertificates
+                Effect: Allow
+                Action: acm:DeleteCertificate
+                Resource: !Sub 'arn:${AWS::Partition}:acm:${AWS::Region}:${AWS::AccountId}:certificate/*'
+  CertFunction:
+    Type: AWS::Lambda::Function
+    Condition: GenerateCertificate
+    Properties:
+      Description: Generates a self-signed RSA-2048 certificate and imports it into ACM (demo only)
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 180
+      MemorySize: 1024
+      Role: !GetAtt CertFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import base64, zlib
+          exec(zlib.decompress(base64.b64decode('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')).decode())
+  GeneratedCertificate:
+    Type: Custom::SelfSignedCertificate
+    Condition: GenerateCertificate
+    Properties:
+      ServiceToken: !GetAtt CertFunction.Arn
+      CommonName: pq-demo.example.internal
+      ValidityDays: 7
+
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.77.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: pq-alb-demo}]
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.77.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: pq-alb-demo-a}]
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.77.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: pq-alb-demo-b}]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  RtaA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable}
+  RtaB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable}
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB, reachable from the test client only
+      VpcId: !Ref Vpc
+  ClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Test client, no inbound, outbound 443 and 8443 only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 8443, ToPort: 9443, CidrIp: 10.77.0.0/16}
+  AlbIngress443:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: {GroupId: !Ref AlbSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref ClientSecurityGroup}
+  AlbIngress8443:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: {GroupId: !Ref AlbSecurityGroup, IpProtocol: tcp, FromPort: 8443, ToPort: 8443, SourceSecurityGroupId: !Ref ClientSecurityGroup}
+
+  AlbIngress9443:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: {GroupId: !Ref AlbSecurityGroup, IpProtocol: tcp, FromPort: 9443, ToPort: 9443, SourceSecurityGroupId: !Ref ClientSecurityGroup}
+
+  # ---------------------------------------------------------------- connection logs bucket
+  LogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:   # connection logs only support SSE-S3
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules: [{Id: expire-demo-logs, Status: Enabled, ExpirationInDays: 3}]
+  LogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowElbConnectionLogs
+            Effect: Allow
+            Principal: {Service: logdelivery.elasticloadbalancing.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${LogBucket}/${LogPrefix}/AWSLogs/${AWS::AccountId}/*'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${LogBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${LogBucket}/*'
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  # ---------------------------------------------------------------- load balancer
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: [LogBucketPolicy, DefaultRoute]
+    Properties:
+      Type: application
+      Scheme: internal
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: connection_logs.s3.enabled, Value: 'true'}
+        - {Key: connection_logs.s3.bucket, Value: !Ref LogBucket}
+        - {Key: connection_logs.s3.prefix, Value: !Ref LogPrefix}
+  PqListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: !Ref PqSecurityPolicy
+      Certificates: [{CertificateArn: !If [GenerateCertificate, !GetAtt GeneratedCertificate.CertificateArn, !Ref CertificateArn]}]
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: '200', ContentType: text/plain, MessageBody: 'PQ listener (port 443)'}
+  ClassicListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 8443
+      Protocol: HTTPS
+      SslPolicy: !Ref ClassicSecurityPolicy
+      Certificates: [{CertificateArn: !If [GenerateCertificate, !GetAtt GeneratedCertificate.CertificateArn, !Ref CertificateArn]}]
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: '200', ContentType: text/plain, MessageBody: 'Classical listener (port 8443)'}
+
+  Tls13Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 9443
+      Protocol: HTTPS
+      SslPolicy: !Ref Tls13OnlySecurityPolicy
+      Certificates: [{CertificateArn: !If [GenerateCertificate, !GetAtt GeneratedCertificate.CertificateArn, !Ref CertificateArn]}]
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: '200', ContentType: text/plain, MessageBody: 'TLS 1.3 only PQ listener (port 9443)'}
+
+  # ---------------------------------------------------------------- test client
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: pq-alb-demo-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadElbConfig
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeLoadBalancerAttributes
+                  - elasticloadbalancing:DescribeSSLPolicies
+                Resource: '*'
+              - Sid: ReadConnectionLogs
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt LogBucket.Arn
+              - Sid: ReadConnectionLogObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${LogBucket.Arn}/*'
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref InstanceRole]}
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 2, HttpEndpoint: enabled}
+  DemoInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PqListener, ClassicListener, Tls13Listener]
+    CreationPolicy:
+      ResourceSignal: {Count: 1, Timeout: PT25M}
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /opt/pq-alb-demo/demo.env:
+              mode: '000644'
+              owner: root
+              group: root
+              content: !Sub |
+                ALB_DNS=${Alb.DNSName}
+                ALB_ARN=${Alb}
+                AWS_REGION=${AWS::Region}
+                AWS_DEFAULT_REGION=${AWS::Region}
+                LOG_BUCKET=${LogBucket}
+                LOG_PREFIX=${LogPrefix}
+                PQ_PORT=443
+                CLASSIC_PORT=8443
+                TLS13_PORT=9443
+                SNI_NAME=pq-demo.example.internal
+            /opt/pq-alb-demo/scripts.tgz.b64:
+              mode: '000600'
+              owner: root
+              group: root
+              content: |
+                H4sIAAAAAAAC/+1dfVvbRrbv3/4UUwXWdoL8CqQxcXoJcVueEmCBNN1NWSpkGXSxZVeSIYSwn/3+
+                zpkZaSTLQNs0eXavhwdbL/N65sx5n3GjYUdePJ3Y44kXRNGwFp1/9alTA+np2hp/I+W/263Vp/pa
+                Pm+2m+uNr0Tjq8+QplHshGg+HI/ju/Ld9/4/ND36uj6NwvqpH9S94FKcOtF56ZFoNIQtXjsXnoim
+                oSecQOwBPQ4Pd8SLrmjX1oQfCefS8YfO6dATldc79o+91+L8+jT0++IsHE8nUbUmDqaBcCJBkBNO
+                LAZ+GMXiFHc1NHHguV4Qi82R82EciB0/mL4XrUarLUJv6DmRF4no3J8k7aLRDTGOz73wyo88uq29
+                p16cTv0hqg7HIxGNp6HrCT+Ix6I+nsR1hdLttVoJOC7saelV7/Xeyavtg661dKOvOzZnnvxmO8NT
+                u++NxrdWaW+/t4tmT37qHRxu7+1S/tyjjk19eIa8vd2fTvbeHCGPrlK3XANIrVLp0gtPxheVqrgR
+                74S1VJmE6ONAlJejXwKqpPFLUMbzpiU+YhAhevoTrs49py/sZtUSXWFxNkscb4jbkjsNQ4CO61MN
+                CTQR+YBj60W9713Wg+lwiCqcqwtRvuHmxFLrtkylS557PhZWt6vLdkR0HcXeKKljqaJaqFolfyC+
+                FrL/1PPkxYbAVAQlIWZri8NrPzgTmITppO/EHuXUTUwc98I58ywU7AcDYV8L21bzjUa6Q2QHiqhy
+                emwfP6LOqVca+CXqz/290TP1cnu3i1zj0cgJAMpLXSNA+gLl1bxZhaOYRjQI1W2NhCZkUOi9H4sG
+                d2u2POFln6pIyubwJ4OzlRhrDUtKDLwrMcJaABzQhoKRH4BGYULPXFeMaFFOvHBou2OszA9Dn3D2
+                0huKX9AlgOquMrLgd37Qf+kH8mZ7f8veGvXlzZH3PsbHaEIToTMPPXtrPJo4YfbJ5FrevnJix341
+                HeGmoDcMo2YpHk2wPCqjC0BzIuw+xub2MQV4bhnZAN2hsAcRwGWPNSxroM+1sw9co3Uex5OoU6+f
+                +fH59LSGudVrLfnW9KPeH18Fw7HT12/smTV8e8cr1azZPTwR9vsPg1zPeCjzKzJrqNW3xsHAPyOi
+                atuT0Bv477tZWoXn6rrvh7l3dVoOwdjuj92Ivmm1RBIw9tvhih1OnPh8JVcGc7K+at2Tw+wko4v9
+                v5ivYBKO3erMO4VbJ9GV8WZ26eVaIRaj7nLrb35GTZNKXy3SX5MaTRsw9gfXtprVv0AAvEf+W11f
+                beflv3azuZD/vqD814T8t3XuuRfgrBDdiIUza3aHPkltjCsBCVuRAB8KPTceXgsSsqYTKfdBjqBC
+                OiNJfIJrF0UYl8hnLJpVmDdUQP8CZ+Th8ubl5uEPJ4d7bw62eu8ax7cWaNLf/iYmV8RIHkFQ9IZD
+                l3sr+WkXFI1qraEsiWPy1ioRNzjBMEtoz41J1rGaNaFJskNPrNJgHIpLdFxs7rw8ebV7yN+bB7ti
+                8+3hyUHve+LdO3vfn7x8s/Vj74gv9w96323/LPb/frK/d3AktnY2Dw+3t+TN0c5hs82XG6I/Bql+
+                J+yAxvT1ZccGczjmkThRJCySPUlkFH3whQDywNKlqFDGW0mDBxC4C3NBUhgHXomEy+82t3csYXu/
+                iQaqRqEbFm42lIiz5QQBpHF3HMSQMjxxBT46nsoJdk041CBUScrOQmMCr1ZNHI3Hw4hFQ0WlIY4l
+                EpgcSU5bSFSFDkQoS0tClqbuVYzSFNPSHFXMrzeMPFQsBz+vYvC3wXga9IsbgFj8tyYUkkPPE/VL
+                J6wPx2da4J9GXghx06nhmahEbuhPINU10DAEO4zRqG3oYwXYF94IBc/GIUA3inIS91noQb75zRfl
+                0RAZyzm4HJ1jwegxUHWRkLpTMswrJwzuyiessuaNRd0pYzGMr0g4UAUElmt4zYMxIOwgi9FvAk+K
+                hsBzoPC2ZvMeA5VK2LYJz4yKkmDnTGHLbJcFvLkN89u0YFpp7oWBjm0s39DrY5C+Q0i5/YroB3WW
+                YHbmxbZLZULb5zwxKRy/Tb3wWmwCzhC1pvGE0B+Cr0QSdBfCI2Z9+5VFROAxejYdeX07HA+9x1XV
+                021N/+ipcNMeiKtxeAF4UemNDYECcgR3F7BUeyjhRY5rjG+1Jna9mPIIktxIq6KlSoQM1HRIVYa8
+                FDFUIsznYxq3taRol5UHdg4fdT4o3dF4eAliggaWKvMqy2mUzduyIN1MlEmBxV9+tc5Uz3hIBHZC
+                sLWWFMWk8ZtEk+5TumkpwolRxv7II3K1JlmJ7QrLe++5ov1cjjN2J3XdaH0JuoWxOpOhJ4txa19M
+                SN1emqCDjnvOhIQUOzkGPYrifMBKxR9z0wE2CHwlVGNDiCDUp6XqBTRVqNSX1Dqd5DWiTLDBoZ4z
+                nkywiOhuQnWcm8ikvIBSEdHkVe4qX83Rm5niGN6d7Y/8iBRknk/0dpasMpeicZoMTjYDejAZejz0
+                kRNeAGJJo1jxZofuyGmx1RKPIXbEPrD7FGtrGgTcqRS0h1PQHqJ/kv1RN5ie7QPZ1ATzPbFNIaGB
+                GiI8eQuWryYjx1Ul6BVD3d49PNrc2dk8IrFga+/1/k7vqKd5Z2ODcako6/auzgzmx61TX6AXVqJq
+                1eC9gO9fK/+3tDRGszYZD333+lOrAPfI/+vr6zPy/9NGeyH/f0H5v5XI/xAnCmgcy/3KkoH1c3Xu
+                u+ck6qbET6KSIHqZkD9Y1bxohVUBWmxas+CsvsdVxo4frDDNvDr3yNxLDwO1nEFfYCSD7cQLiAb3
+                oWpAArHHwfDaVDCKUfqL6hg7CgIRDy0LJJ/44s7hkZZcvOHpZQvSPcmip549TIraNlVu60mwmVIu
+                KfXEYjuQTFrGKSfNvjuuvdsHD1vZD8fx2B0PVw6j4T6D5rhcKAdJ3UFywFeqL0l1xKDR44yOIIkc
+                P84KCpChhWSgy/Z6pD5g+rZWIELgv4X/9m25xMLAzvbWPwgQs7VBfCQjYiIylJea3e5EaGEENWCi
+                tnYeUkdW1iis6IiFj3trMqSU4npKSt1LBpfR+DRASV2WIobWIQFXEr4qahml5U1h+77iiTBrtE4y
+                7f7fE0l2P1NMtcZLQi3GCGqtqCjXzgQSIXDLCeLpqJqVcB9UEfDmbBx3hNkhLfQqQCUzeA+gMkp2
+                HlpJJXdDq6COBGRGPxKQmSPNlFXtElUcor8+lA5RoXFD3K/KQcO4D0DKjB1hVi+haE7H76k70RkU
+                /FLEvQeAKerOgC+t4274zVSRQM/shQJf024//sifM+hn1JOO1mF+0qy1BdH3FHhFaPc7K1BIaHZy
+                VvWCpUMSSEZgCJ2RtA2hEkN5kaWzAzaRJ2v0QVlLmmW0BSZxPtm24Nd4sH+wd7Q3hxuQjyHhl7ZN
+                CyzSFSdkX9N25AErq9GtIvtREbHXSlyslTghdre293/4M10YesFZfF7J9WTLn4ClR9VilpPAglQ0
+                3WEiFgSPzFtX1iME3nJXlQWMMihGtDuOYW5iyYXsJOOBuPAgjryH+hacecpJTWhC9jB4tzgLZd/c
+                3xaybzUy+WH+XBgAMP3SFKrRiAY/HgxIp5MN/txaW2s+e70Do8vT9W9WoNK5+6219bCpHzHrp6ft
+                b1bV02ajtSoCggD07nR5y85tCG2Nagvp6QGrJQyEEjqs5a0gWSnJKm0eHR3MkyiyUkQc4yl5HP+A
+                gLGZFH73LQnScXRCJsXKj971ivg1Fd1OqFO/ViGF0JufnOHU+z1yB3r1UnUqbZEWGo0Sa0wO1jLE
+                EH5RIIcsR3CnZ6QPSB65MsqIJ8q5/teidk1Jnu/edSI4s73O8fFjck6XU0q7NV9eNYjpXbnm9ccq
+                6M/p1L3wYrM7S6lx2prfq7Mxm3rMvHP7Npu3xBa2tjPx2QZoy15gPtWFlal4rsFvB5YEVQILEWjd
+                53gS9ozHZALV7gOTCz24zOc0A2CNCEnxYQTY/W77+zcHUs/f+7HYGDC3wA+bh6of9PHmoFc5/Cvt
+                AY02e5HtwANP9KXp/1N7AO/T/9daM/Ff5BJc6P9fTv9vQ/+HzHDpSS3dmdHrT4dj9yJSijpyADv7
+                Y4+5aU3swewHNtuPzlXkiSCx0FTRC7EO71mc00qEIP6eiG0rSpxriSck1OnMhuhXkFnKfjpvRq7u
+                GAxXDSoRqz+7rSD1pKU+uxlvF9O736Y+TC6icq+7SwXgFblbawWKu2prjodOU84jJ4RzgMQubdoX
+                FQBd630rNAM0I7U2W2VMyXzFgHdGwyEt+RH6MwG1PpE28+dw6nnDF+I56Rn4kgIRLmQuTwUZvhDv
+                YrhQBkPn7BjIkqLcCKsaoYuu6yErCSSSNXChktkSBdGVWNo8pYltkUzRpo+btY5to/LmSfvWks4H
+                4gAQRV/2TkDUmQs0pYaVvvj+YO/NPgfsLa1aCYtQvhb41F+ITEbla9DeEgQAWskAl1ZXBKmNZgHo
+                4ckQxxfdpDfEIMygwnLa0zdHqQTh90SZR/2Rw7AgD3/UesFHKZkDxcqJX2+dwhHRk3JU/1ddCX4f
+                Rb3MTOg2nTLg7Nz50tPzYv70VOSUs1ua1ozXr5aSmufOz+pdk1IAdyU6UXsJGq4YblJYNiIfgkS1
+                aFLSnl9RPKs3gB2zb+XhoJ7/IWCQ90IWL2Vr+wMAaBQCACEKbw57r8TpdZEHcXbMhtlVzRTBzsTG
+                6opIsNWR3XeGGioZ6+c8Gk4WB8NqRFTGpALWlow2YTUrElkFCzXIB8LKOBKzuTrydub53S3Nqm4y
+                ZVuayVX47N6GctrgnIayuYofPgB60hRSocW2//fqbFM5cFnpSuS8evZUGNCclK2SQg+ZkLasnHWl
+                mFlrpEg5x5/AC9M++wdRQ/fNnQtOPeaCxmYhqanEg2A5U2sxMEn/n5FlZk2cWLAqzoeEnD8G1EoE
+                VQnZBpAkThHNXS3w3d8N51lI3NmyRlhIVU6oGX9VgubOdhNQtU1Qvc04nWDbw94GEmJdGRjFYi1Z
+                MWPx/Hn56OejMkjjy509KLIJ6VQlO4y1SkCSkrA0S4Fe+mRNMfJq0ViOUVT03GtL6rPV1Xa1Rna3
+                vSPZB4w0TR3DlqnQhW1RuWolK6uJ7Vizu0gKPxIwK9Qcxdlfl8TclCxKGL/SG+H0+2RQdZ2Jc+oP
+                oQesmBI/LBewS1E4YEyDOGR7wUUAz+EVhEY/Ui56g/GS3q6R0bQ1dMiJLxqrK5KBNdZrJUzCH9Tk
+                H6C37/a+3zvalpo3FO/ez/u9raPeq2KdXarlW5uHpJPzVBUU+Qw++0+qm6/aNBd2Og+2NC2dfz79
+                H7u9cvr/ahvZF/r/l9P/V6H/H+g1SraqvBee7W2HbenO5jXpf5BbfTJm9sjDUisSOU1jwFwUNAnT
+                I0kzpLGBiSsspiAxXM/bze2jk9fbu2+OeofdZuMB9T4iyjYUU3hhhhwj6fOOM5As8MJK3xv6RCip
+                JaaY4t9rtC+nShvXQKBSw7zc1BaNkzhp2i4XmnSNY+qGY0hQTlz77IaFDGTQgHnfsRvQbTe3tvbe
+                7B49OG7SdWF5iLO2e/ROxkB3peVX3tThPoG5NkJInmyj7oEDxL5L3ZOIACsr3iaB1XWr9Hbv4Mfc
+                XiFQ7NCZiHI4EnZIEbmUxyqD9G6DNQy82D1XalImR51276hLsntQdN2GGF0A3MKeGJlQUNqzhYvH
+                URv7iwz7dX1JjsZKS9Qt3rcGi1gENME18H047Xui/JicGn6g7wgLyFR/8phax14h9nlAorEJ1Wwv
+                DMdhRAwj6JudtoFqfW8Czo04HEaN8mNZmKMdR5fCjs38N7fiidQGh5EGD3WTChVHgIqzafAB2ysp
+                gjKffxZmYGhCBiXmXonjUrKj8KU0ymM74TwAlvpYjkPErGNXXgV2Jt7l92Q5qkK8NPFSPBbrDVGt
+                luTq5AlOY0B5C2VSFMA6o5Wjq7aM0EjpMEwuyCeYo2PJyr/2YLY8mglzUnSAd+ZBsFC0YE1v0ZPS
+                SkIMpNBiGQ2GXkxEJMju7IMgxqFQM2QLhOLKgQylqiBxoi0jRlPfJ2WgfYXkCCSqKgkQjYV6WKuR
+                bS8aerD3tBsq0FQWpX170mNamcE3E8cQgukKe0jKoYIOFeFn4nkeAaTt7jvfG0I+rGhXKYTXcdj3
+                wmoH1hiK2QWPxVrWus4JEE8Lsics/64mIWLyfk1Acj/RPmCxzrdSukZzT/k2saCc0G7FwL1G5KTA
+                +EWzye+l1fMETcfTSDRbPPUnoCSud4JQlmabc4FbJcyquUqeUtGEpXVyAokXsaZRfqdIQtTB1JKw
+                Nu4zcUKT95GTjHyPAoa6VWH9gqDVpTX13WxviODdxfGTJxuE0pWlp+JrGA1ti/b0RvSiu/R0Q7ic
+                RdzCSMs8sLf7Cu+1M3PZ/oaiqZ7RR6uFzzSuyqIe0TeGqL7MkdIjpuJ04VyeGdaoyghrasNUEAjR
+                KheExAH3bgLxv3KxIgYrPJjqRlabmN+7vu7d4F3zmD5b/NnGJ8FiBZY5fIlv0QTXUbGWa80B8hNA
+                6vTucRPiYRUozJACWMpy82OOKJEBnYUFO2RTpt78skQ3tDwAnJldLTvgTAJrUFOECuHtCk/tCmHK
+                itLuVgxg4aE541gMMRnQEOqBimZ7lfVFwxMN0KwRfBhSLf58mo2NgyK0tIb/dfw/pWcUKJdV/Ekc
+                sCh47rDX25VcvChYbtWMTaNqCjooN59PZ4L6Ec5SUHk+iu7PtCAnKCM6XlKQQCQlyJn4NqUWL92o
+                cXfsAKTu9uEV5VxBSzdqjElFmtOYdvXEti4bVZE+8lKOiP4oj7Kc1/+1VO+XM+OWxFWyrZbBrJR/
+                hVnQmdrF0/dJryd1v2hAmgNge0hCikCrXbVZG69GUv1PGFQtCftXPh+yrVCM/gUxBMS/cM0SUhBp
+                B044w+GI/SQtc+RKIisTAeRl55wh3K/GewNkOxUalvfecSEpY3XBs06DPAOEqKbULUQ1mCGGyZBl
+                fAQBBaz0lNySsMNTcM5VqE0toxrQaLGf93fr5mv2KZjnOe2vsBPK9mlDAO7R/9cajVZe/28t9v9+
+                Uf1/jeL/U0ICoiJj6Bys+Su2RaaCtOlIv4xEQahwhnyZmv885OMs20c9GRNz2G3jQBpE4rx+s99t
+                Ne4v26NNB5FDm4fgiyUCNyD151e9cxKyJAufvzJ1q9ApBxD1BAewQRehDV9PeJBJvVWpHWRzMlD8
+                CA3yESckQxM9O8UxNRzwAPEgkvv1NCGXO6ZHnkPhRejTBqgZdsZBKdBE3WGrBiIS6YiIVNJgIfrz
+                Ww+MKUD16V3HbjXIdqDmhO0KdEXP6fQcPg3nBl/yfB3aG4ajPvTesGRYtlLkwBifLP9jebTcP1r+
+                Yfn18uE/q6jF0NT5mIjfGyPx0PiHEhCED9N5JGUDFRoKnynzfgqfdCbEzkcROCeM88BzPMR11E01
+                0eXdKp7oDYrQIYwoCo1vQtui0q2RHXK24giuEJ3U03i4u32yu/m617EBMLnd+z0jcw3doWzDWx2M
+                qTwckCZkp9lD/DzV+HPKP3H+mT4rkc7BlCGmElenuIIiXX4Jm8xuKq/W2gMWTCuntlOtNyWxhjia
+                WABkcIgZGwKHgCf3k5MSmeKPjLEbTScywu41xUJoF/d9rtwNKfzJJhmdOe4nUcZ0TBEpuwShfMxF
+                UbRG3nN0bGIYLXyzgT6oGy3RpCHleMnJSlIzz6KaHuODHGYb2TGmRLZoqDPD5Fj1E1LblioRh0VY
+                GtRVMqYwWXyA49zcQCuLFHY+m1HaHTpsS8LaxcKvxe9jjCh9pIbDz4v6miKL6m9iB3aGvAjoZKkx
+                +e1cHDdEa66PVR4Dnx86sFznkpLzxlfYczlSrW1OcMTVWkNMnq3h/xlunffwIz4HlSYzRMT2E6NJ
+                kGVd0h0JFyVdlHRR0p1X0mxc6U2lREWx26tQH7+Z+WethXdmsHrPDCjTUbT20FoSLNQO4QI/MylG
+                7og/1xr89WxNfj2Tr5z31gPbU9JEzimcjxuh7Qfc3kS2N5HtTWR7E26PQWXQOs6qqB13U9G7xIJB
+                AEoZd0csP6m1BmACosIkTSzj9n2VSaJjnxJdfNGA9cKpnwLNYaYAaTSboy7p5uh6pjnMxZ9sTtKL
+                A+dKCT9EdFN0Y/VqFoMXOtD/a/1vHRJGDJGE7B4kb0hJ5ZM6gO/z/2IHeF7/w5lQC/3vC+p/69D/
+                XjFekJ2RJGfiU1AAOTgFyove863QxYivfLt99AOIDFTFuSrgt4YKOB//OBOReOyD6R3sduWROh9H
+                QzrzpvyQ4uTBjua5sMl2602ivKc2zkp7EcU3SyshkU8jKE1G/JAVHVVN2DGhpPzt/Y7Sgs2YZyN2
+                V51roWKTSXaREqSsE7FOpHtWdHwU7TkcwqLGeilLkFXSoTfNAcl+kFVMMcwrcvLlHRwjB540LzKA
+                Cps7xAJSjaBbwbF0CZM3zpVypsMYTWQg/vHi+tQLy0oTTgUBC40Pp6NAeeWT7XYaMwDTkX8Wkrx2
+                6g3o0Mrr8RSK0tk5AIwBXyM0Ozj7/LqtgVkW25HVXceeHfV/vpu8yO39X+D05vNpH+r0Ls33A8P/
+                a0R9mCEffBRrLRv1Ic3gFMUG926i4bXJ4P07/OrkOR2w57RjukZX8t7QlZw7dCXjD10p8GSi4qPz
+                EIedAfdAa7DiJ9mDNLAmHZPKdZjWKtIhXSv30w4uk9I3FRBZROU0S1Cx9hW2KM6QhypXqKif7ARu
+                VEylIowZP4jyIVTIG9jR8fNGB0A4nTzp1CL5pGm6x+hBK3ecAz1zYpVLjhhCO3Cowp6uJpkI+Kol
+                Y0+EuIApYakFj+6EPJa4afJjcvDG4+H4ygsr8ItVxb+p4qo4Z++udPVTkCE7gjGZXfYEE3VbWlc3
+                2O2ey3yjnMMboPTXsjXyLou6YPcye4zpn13GpaxjtrmudKxmQ16IxG+cYCHdSHyQjzWxx42cIboi
+                MmVyONrgUM+7RLM+ZMCmOtOVPnWlzxdJV+BhPmevsMufg4yHWI1ZOoJppOU/7gTWmY72cDqT+OEf
+                L2mbGEV3AgulBv7XoIyItfe/EDnopYkW3W6CFHwJlEiyuBQkUMrEB6D2BiBIHy59DJ40CqCkLQjq
+                cMisJGRKQXRaAsNHUwk8IFCJ7KEUasFX+YCLzXQ1Z2QZlmBo4z6BOHG0Ij85ReM0RDfjFOX60rZS
+                WkZRH4nRHBRS7UchFySQs4yg8Us6uBSRgiTZuOE1KDgFjIRlIvN0Sul4enZuBmv7RORqVs4nmwkL
+                UhZAFobZ+bhiBJHXxJsJCFpfeU6kTAj5I0TcMgGAAIL2wVuceBzmfbI95j0p7UzJGQPQ0VQ6caeY
+                ftbDxPhIvOyUbK8eXLyAS3/qelHO1aonxZCA+cSEa7kbXe/tIWYxmXg4/Jpdrws/63+V/v/UJlnG
+                pgUnw2U/efj3ffp/q9Vay+v/zeZC//+S+v9T6P9vZ0I9ckKzlpfVZo1kTwcHiFcaq9Xk7EuTciu5
+                r9JYr5qu4Hl4WLxNBa46hyIo19KYStkH3j3C7TbW09Dwl73v9g56SajlN/e0iYKakq6qnZQIFpcR
+                NwgPJ964t7OThKtWlMaMqK8qyThsaU9jMzlyNNkEQ7znTym7+5vYx5mEcquRHfZwisQr+GU5svam
+                YNAde+1WB9ZCnaUBsN5rDKRjN8l7q5jJWxVoihq5SUh2641qlQCePluWz9JgJDK0AD4KNeD/iwpR
+                h2FSYTc67XXWHskfOsuvO8uH2LsOTd0bsChF7VglWJtQggQFem5IChwWDCllwkHF9BK+kjZZxvm6
+                Q9dVkhFlUCx8nMgL+Y+rT4rYXIXMONMIw155KyCf9jvLjVafy5GLAnVwFQo8+lZCxojA1QLoo1yS
+                my3y+yvyuax8JD9NnCXxWFo45m93wGhDd7W79O09/SCjn16eWcNUQXfMlucb4bjpdWqaoIpeULCx
+                p4HKarN8XEqu1xfixWdM0i72F8sY9/z+A1x7Of4Pj8DTBf//cvz/UO61hVEVhiMOYyKbal/v5OLf
+                4VLmsEjuJifGCwbGPwQBvv7wX9qijZtd7LOkvZX0TQcudRulxFCrdvYww3RKxPkNW2/fj+j0p+7h
+                VrPxrCk3qYTC+CEu/WMJ6izEWuG7312r+fNeBRVnfv1Ldv0JdV3FA5k/Jobfyeno3/sBMGCOoB2t
+                Fd6ZfyMYNsxrsbkVJyZUq5p4v6NHx7D08JlntOtVl2E4ogzvVc2WoUeqjP4Rilb6GxTJ4XqUEEa0
+                QebNKU6Aa1ATdCSWboKnCE3Qd64JevRHm1BR7RyKZTIqmMBwhAWMHmyuecQ/Bqb8GxR2h597YjVV
+                B4JB0qJAMMgjrOYDPeXZFSShFP5QnRFYppBNxnhBfsE1/S6ZNeeUnbt+a40tX7LwDb6Wl+3HfJCM
+                AgseWenpMfN+Eo5z3fujcCUGi4wtyh86khyQk/h1dMzYsdzLGHHUS2pl0JaT2R2bdEh9JPRZI6LS
+                LLL14owBIwwJTVSSICUFcNgNKxRjjzHA9DMNaJ94IFWF5MyamoyUykwHSSM0EAJo2zicB6fkTOJu
+                pZrCtqUgK1+YoXGUCfXQhH7uSD11oMMSDYEPGKLevfsfCPdmvF5yEKYGM0ghW5Dzx/ug65mjCo3z
+                ezDyrx+eX1R293Z7VfVLJWm7TbXt71GysFQ0JCGG+mUDAHU3nV157pN81xFwHVWy64yWJI4tIfjV
+                9z00Tr80J3AeJDJjC5A49emIVWqxkj8Ks0rYi27wL+qpnxZSy7AmXlK8LVb3SEbPOjisZoL+1BIo
+                Mip2c6vMAArZwOygxwcd5cbzSzqgx/X6BGbj+r8qcgwfaQxVYxCPK+827X869oeG/ezEPn5SrT2u
+                /9KqT8rmur3/0J5Mn9VKITuv/F2ID/noxeJielnpzZvJyurKUUuSwaFlHVbcJRkIpqNT2s+Gf9pM
+                SaCO4j6dyK4m3yoKHbNKXJHm1EysgoQkOu92D467S8CnCLvamnIr22AaSGVn4sYVkAThV2+E30Ub
+                lQmFlj7ePaiScbziP0/uhS8N5njWrPqEoHT9Am/87u5Bwkucd/6x2jAHe/gNZdo96HYbVUWcrQAj
+                yP0rF95taXYbGwVhFXywjyKq7x6s8BDWGlV58WxNXzzDBY9dcIzsQtVYpEVapEVapEVapEVapEVa
+                pEVapEVapEVapEVapEVapEVapEVapEVapEVapEVapEVapEVapEVapEVapE+U/g/JteXAAKAAAA==
+          commands:
+            10-extract-scripts:
+              command: >-
+                mkdir -p /opt/pq-alb-demo/scripts &&
+                base64 -d /opt/pq-alb-demo/scripts.tgz.b64 | tar -xzf - -C /opt/pq-alb-demo/scripts &&
+                chmod 755 /opt/pq-alb-demo/scripts/*.sh &&
+                chmod 755 /opt/pq-alb-demo /opt/pq-alb-demo/scripts
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetA
+      SecurityGroupIds: [!Ref ClientSecurityGroup]
+      Tags: [{Key: Name, Value: pq-alb-demo-client}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee -a /var/log/pq-alb-userdata.log) 2>&1
+          set -x
+          signal() { /opt/aws/bin/cfn-signal -e "$1" --stack ${AWS::StackName} --resource DemoInstance --region ${AWS::Region}; }
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DemoInstance --region ${AWS::Region} || { signal 1; exit 1; }
+          DEMO_DIR=/opt/pq-alb-demo bash /opt/pq-alb-demo/scripts/00-setup-openssl.sh || { signal 1; exit 1; }
+          chmod 644 /opt/pq-alb-demo/openssl.env
+          touch /var/log/pq-alb-demo.done
+          signal 0
+
+Outputs:
+  CertificateInUse:
+    Value: !If [GenerateCertificate, !GetAtt GeneratedCertificate.CertificateArn, !Ref CertificateArn]
+  InstanceId:
+    Value: !Ref DemoInstance
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  LogBucketName:
+    Value: !Ref LogBucket
+  PqListenerPolicy:
+    Value: !Ref PqSecurityPolicy
+  ClassicListenerPolicy:
+    Value: !Ref ClassicSecurityPolicy
+  Tls13ListenerPolicy:
+    Value: !Ref Tls13OnlySecurityPolicy
+  ScriptsDirectory:
+    Value: /opt/pq-alb-demo/scripts
+  SessionCommand:
+    Value: !Sub 'aws ssm start-session --region ${AWS::Region} --target ${DemoInstance}'
